@@ -4,7 +4,9 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - 'input_images/**'
+      - 'input_pdfs/**'
+      - 'ocr_script.py'
+      - 'requirements.txt'
 
 permissions:
   contents: write
@@ -12,6 +14,7 @@ permissions:
 jobs:
   process_ocr:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -21,10 +24,10 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install Tesseract OCR and Arabic Language
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y tesseract-ocr tesseract-ocr-ara
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-ara poppler-utils
 
       - name: Install Python dependencies
         run: |
@@ -38,6 +41,6 @@ jobs:
         run: |
           git config --global user.name "AdamOCR Bot"
           git config --global user.email "bot@adamocr.local"
-          git add result.txt
-          git commit -m "Update OCR Results" || exit 0
+          git add results/
+          git diff --quiet && git diff --staged --quiet || git commit -m "Update OCR results"
           git push

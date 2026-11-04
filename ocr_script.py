@@ -1,7 +1,5 @@
 """
 AdamOCR — استخراج نصوص وحقول وخدمات من فواتير طبية PDF
-- PyMuPDF + Tesseract OCR
-- استخراج: بيانات المريض + doctor_name_raw + services (اسم عربي + كمية فقط)
 """
 import os
 import re
@@ -170,8 +168,14 @@ HEADER_KEYWORDS = [
 
 
 def _clean_line(line):
+    """تنظيف: -—~ و .xxx تصبح أرقام واضحة."""
+    # -—~ بين أرقام → مسافة
     line = re.sub(r'[-—~_]+', ' ', line)
+    # .xxx (نقطة + رقم) → 0.xxx
+    line = re.sub(r'(?<![\d])\.(\d)', r'0.\1', line)
+    # ... (نقاط متكررة) → مسافة
     line = re.sub(r'\.{2,}', ' ', line)
+    # رموز غريبة
     line = re.sub(r'[^\w\s\./()\u0600-\u06FF]', ' ', line)
     line = re.sub(r'\s+', ' ', line).strip()
     return line
@@ -182,23 +186,19 @@ def extract_services(original_text):
     services = []
     seen_names = set()
 
-    def extract_section(section_names):
-        for sn in section_names:
-            pattern = rf'{sn}\s*:?\s*(.*?)(?=خدمات |الصيدلية|الإجمال[ىي]|$)'
-            m = re.search(pattern, text, re.DOTALL)
-            if m:
-                return m.group(1)
-        return ''
+    def extract_section(section_regex):
+        m = re.search(rf'{section_regex}\s*:?\s*(.*?)(?=خدمات\s+المعمل|خدمات\s+الأشعة|الصيدلية|الخدمات\s+الأخر[ىي]|الإجمال[ىي]|$)', text, re.DOTALL)
+        return m.group(1) if m else ''
 
     section_groups = [
-        (['الخدمات الآخر', 'الخدمات الأخرى', 'الخدمات الاخرى', 'الخدمات الاخر'], 'الخدمات الأخرى'),
-        (['الصيدلية', 'صيدلية'], 'الصيدلية'),
-        (['خدمات المعمل', 'معمل'], 'خدمات المعمل'),
-        (['خدمات الأشعة', 'أشعة', 'اشعة'], 'خدمات الأشعة'),
+        (r'الخدمات\s+الأخر[ىي]|الخدمات\s+الأخرى|الخدمات\s+الاخرى|الخدمات\s+الاخر', 'الخدمات الأخرى'),
+        (r'الصيدلية|صيدلية', 'الصيدلية'),
+        (r'خدمات\s+المعمل|معمل', 'خدمات المعمل'),
+        (r'خدمات\s+الأشعة|أشعة|اشعة', 'خدمات الأشعة'),
     ]
 
-    for patterns, display_name in section_groups:
-        section_text = extract_section(patterns)
+    for section_regex, display_name in section_groups:
+        section_text = extract_section(section_regex)
         if not section_text:
             continue
 
@@ -206,6 +206,11 @@ def extract_services(original_text):
             line = raw_line.strip()
             if not line:
                 continue
+
+            # تجاهل سطر الإجمالي
+            if re.match(r'^الإجمال[ىي]', line):
+                continue
+
             if any(kw in line for kw in HEADER_KEYWORDS):
                 continue
 
@@ -213,33 +218,38 @@ def extract_services(original_text):
             if not line_clean:
                 continue
 
+            # 5 أرقام في الآخر: qty, price_unit, price_total, patient_share, insurance_share
             m = re.search(
-                r'(.+?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s*$',
+                r'(.+?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s*$',
                 line_clean
             )
             if not m:
                 continue
 
             prefix = m.group(1).strip()
+            # الكمية = أول رقم من الخمسة (group 2)
+            qty_raw = m.group(2)
+            try:
+                qty = int(float(qty_raw))
+            except Exception:
+                continue
 
+            # إزالة أكواد من البداية
             prefix = re.sub(r'^[\w\.\-\s/]{10,}?(?=[\u0600-\u06FF])', '', prefix).strip()
             prefix = re.sub(r'^[\d\.\-\s]+', '', prefix).strip()
             prefix = re.sub(r'\b\d{5,}\b.*$', '', prefix).strip()
+            # إزالة (وحدة + رقم) من الآخر
             prefix = re.sub(
                 rf'\s+(?:{UNITS_PATTERN})\s+\d+(?:\.\d+)?\s*$',
                 '', prefix, flags=re.IGNORECASE
             ).strip()
+            # إزالة وحدة في الآخر لوحدها
             prefix = re.sub(
                 rf'\s+(?:{UNITS_PATTERN})\s*$',
                 '', prefix, flags=re.IGNORECASE
             ).strip()
 
-            qty_m = re.search(r'(\d+)\s*$', prefix)
-            if not qty_m:
-                continue
-            qty = int(qty_m.group(1))
-
-            name = prefix[:qty_m.start()].strip()
+            name = prefix.strip()
             name = re.sub(r'\s+', ' ', name).strip()
             name = re.sub(r'[-—~_.]+$', '', name).strip()
             name = re.sub(r'^[-—~_.]+', '', name).strip()

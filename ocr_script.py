@@ -157,7 +157,7 @@ UNITS = [
 UNITS_PATTERN = '|'.join(re.escape(u) for u in UNITS)
 
 HEADER_KEYWORDS = [
-    'كود الخدمة', 'اسم الخدمة', 'الكمية', 'سعر الوحدة',
+    'كود الخدمة', 'اسم الخدمة', 'سعر الوحدة',
     'حصة المريض', 'حصة التأمين', 'الإجمالي', 'الإجمالى',
     'نوع المريض', 'صفحة', 'Page of', 'مريض خارجى', 'مريض داخلى', 'مريض طوارئ',
     'BLIPBILL', 'فاتورة', 'الهيئة العامة', 'مستشفى الحياة',
@@ -166,12 +166,13 @@ HEADER_KEYWORDS = [
     'Secondary', 'تاريخ', 'وقت', 'Inpatient',
 ]
 
+SECTION_LINE_REGEX = re.compile(r'^(الخدمات\s+الآخر|الصيدلية|خدمات\s+المعمل|خدمات\s+الأشعة)')
+
 
 def _clean_line(line):
-    """تنظيف: -—~ و .xxx تصبح أرقام واضحة."""
     # -—~ بين أرقام → مسافة
     line = re.sub(r'[-—~_]+', ' ', line)
-    # .xxx (نقطة + رقم) → 0.xxx
+    # .xxx (نقطة + رقم بدون رقم قبلها) → 0.xxx
     line = re.sub(r'(?<![\d])\.(\d)', r'0.\1', line)
     # ... (نقاط متكررة) → مسافة
     line = re.sub(r'\.{2,}', ' ', line)
@@ -181,94 +182,107 @@ def _clean_line(line):
     return line
 
 
+def _try_extract_service(line_clean):
+    """محاولة استخراج خدمة من سطر نظيف. إرجاع (qty, name) أو (None, None)."""
+    nums = re.findall(r'\d+(?:\.\d+)?', line_clean)
+    if len(nums) < 3:
+        return None, None
+
+    # جرّب آخر 5 أرقام ثم آخر 4
+    candidates = []
+    if len(nums) >= 5:
+        candidates.append(nums[-5:])
+    if len(nums) >= 4:
+        candidates.append(nums[-4:])
+
+    for tail in candidates:
+        try:
+            qty = int(float(tail[0]))
+            price_unit = float(tail[1])
+            total = float(tail[2])
+            if qty <= 0 or qty > 5000:
+                continue
+            if price_unit <= 0 or price_unit > 500000:
+                continue
+            expected_total = qty * price_unit
+            # نتحقق إن total = qty * price_unit (بهامش 15%)
+            if total > 0 and abs(total - expected_total) / max(total, 1) > 0.15:
+                continue
+            # ممتاز، لقيناه
+            # استخرج الـ prefix بإزالة آخر N أرقام من السطر
+            n = len(tail)
+            pattern = r'\s+'.join([re.escape(str(d)) for d in tail]) + r'\s*$'
+            m = re.search(pattern, line_clean)
+            if not m:
+                continue
+            prefix = line_clean[:m.start()].strip()
+            # تنظيف
+            prefix = re.sub(r'^[\w\.\-\s/]{10,}?(?=[\u0600-\u06FF])', '', prefix).strip()
+            prefix = re.sub(r'^[\d\.\-\s]+', '', prefix).strip()
+            prefix = re.sub(r'\b\d{5,}\b.*$', '', prefix).strip()
+            prefix = re.sub(rf'\s+(?:{UNITS_PATTERN})\s+\d+(?:\.\d+)?\s*$', '', prefix, flags=re.IGNORECASE).strip()
+            prefix = re.sub(rf'\s+(?:{UNITS_PATTERN})\s*$', '', prefix, flags=re.IGNORECASE).strip()
+            name = re.sub(r'\s+', ' ', prefix).strip()
+            name = re.sub(r'[-—~_.]+$', '', name).strip()
+            name = re.sub(r'^[-—~_.]+', '', name).strip()
+            if name and len(name) >= 5:
+                return qty, name
+        except Exception:
+            continue
+    return None, None
+
+
 def extract_services(original_text):
     text = clean_rtl_marks(original_text)
     services = []
     seen_names = set()
+    current_section = None
 
-    def extract_section(section_regex):
-        m = re.search(rf'{section_regex}\s*:?\s*(.*?)(?=خدمات\s+المعمل|خدمات\s+الأشعة|الصيدلية|الخدمات\s+الأخر[ىي]|الإجمال[ىي]|$)', text, re.DOTALL)
-        return m.group(1) if m else ''
-
-    section_groups = [
-        (r'الخدمات\s+الأخر[ىي]|الخدمات\s+الأخرى|الخدمات\s+الاخرى|الخدمات\s+الاخر', 'الخدمات الأخرى'),
-        (r'الصيدلية|صيدلية', 'الصيدلية'),
-        (r'خدمات\s+المعمل|معمل', 'خدمات المعمل'),
-        (r'خدمات\s+الأشعة|أشعة|اشعة', 'خدمات الأشعة'),
-    ]
-
-    for section_regex, display_name in section_groups:
-        section_text = extract_section(section_regex)
-        if not section_text:
+    for raw_line in text.split('\n'):
+        line = raw_line.strip()
+        if not line:
             continue
 
-        for raw_line in section_text.split('\n'):
-            line = raw_line.strip()
-            if not line:
-                continue
+        # تحديث القسم
+        m_section = SECTION_LINE_REGEX.match(line)
+        if m_section:
+            matched = m_section.group(1)
+            if 'الخدمات' in matched:
+                current_section = 'الخدمات الأخرى'
+            elif 'الصيدلية' in matched:
+                current_section = 'الصيدلية'
+            elif 'المعمل' in matched:
+                current_section = 'خدمات المعمل'
+            elif 'الأشعة' in matched:
+                current_section = 'خدمات الأشعة'
+            continue
 
-            # تجاهل سطر الإجمالي
-            if re.match(r'^الإجمال[ىي]', line):
-                continue
+        if current_section is None:
+            continue
 
-            if any(kw in line for kw in HEADER_KEYWORDS):
-                continue
+        if re.match(r'^الإجمال[ىي]', line):
+            continue
+        if any(kw in line for kw in HEADER_KEYWORDS):
+            continue
 
-            line_clean = _clean_line(line)
-            if not line_clean:
-                continue
+        line_clean = _clean_line(line)
+        if not line_clean:
+            continue
 
-            # 5 أرقام في الآخر: qty, price_unit, price_total, patient_share, insurance_share
-            m = re.search(
-                r'(.+?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s*$',
-                line_clean
-            )
-            if not m:
-                continue
+        qty, name = _try_extract_service(line_clean)
+        if qty is None:
+            continue
 
-            prefix = m.group(1).strip()
-            # الكمية = أول رقم من الخمسة (group 2)
-            qty_raw = m.group(2)
-            try:
-                qty = int(float(qty_raw))
-            except Exception:
-                continue
+        key = f'{current_section}|{name}|{qty}'
+        if key in seen_names:
+            continue
+        seen_names.add(key)
 
-            # إزالة أكواد من البداية
-            prefix = re.sub(r'^[\w\.\-\s/]{10,}?(?=[\u0600-\u06FF])', '', prefix).strip()
-            prefix = re.sub(r'^[\d\.\-\s]+', '', prefix).strip()
-            prefix = re.sub(r'\b\d{5,}\b.*$', '', prefix).strip()
-            # إزالة (وحدة + رقم) من الآخر
-            prefix = re.sub(
-                rf'\s+(?:{UNITS_PATTERN})\s+\d+(?:\.\d+)?\s*$',
-                '', prefix, flags=re.IGNORECASE
-            ).strip()
-            # إزالة وحدة في الآخر لوحدها
-            prefix = re.sub(
-                rf'\s+(?:{UNITS_PATTERN})\s*$',
-                '', prefix, flags=re.IGNORECASE
-            ).strip()
-
-            name = prefix.strip()
-            name = re.sub(r'\s+', ' ', name).strip()
-            name = re.sub(r'[-—~_.]+$', '', name).strip()
-            name = re.sub(r'^[-—~_.]+', '', name).strip()
-
-            if not name or len(name) < 5:
-                continue
-            if qty <= 0 or qty > 10000:
-                continue
-
-            key = f'{display_name}|{name}|{qty}'
-            if key in seen_names:
-                continue
-            seen_names.add(key)
-
-            services.append({
-                'section': display_name,
-                'raw_name': name,
-                'qty': qty,
-            })
+        services.append({
+            'section': current_section,
+            'raw_name': name,
+            'qty': qty,
+        })
 
     return services
 

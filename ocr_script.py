@@ -1,8 +1,9 @@
 """
 AdamOCR — استخراج نصوص وحقول من فواتير طبية PDF
-- يدعم PDF نصي (PyMuPDF) و PDF ممسوح (OCR عبر Tesseract)
-- يستخرج حقول الرأس (مريض/طبيب/تاريخ/إجمالي) بـ regex
-- يحفظ كل PDF كـ JSON منفصل في results/
+- PyMuPDF لاستخراج النص (PDF نصي) أو تحويل الصفحات لصور (PDF ممسوح)
+- Tesseract OCR (عربي + إنجليزي)
+- regex لاستخراج الحقول
+- JSON output لكل PDF
 """
 import os
 import re
@@ -14,27 +15,33 @@ OUTPUT_DIR = 'results'
 
 def extract_text_pymupdf(pdf_path):
     try:
-        import fitz  # PyMuPDF
-        doc = fitz.open(pdf_path)
+        import pymupdf
+        doc = pymupdf.open(pdf_path)
         text = ''.join(page.get_text() for page in doc)
         doc.close()
         return text
-    except ImportError:
-        print('  PyMuPDF not installed')
-        return ''
     except Exception as e:
-        print(f'  PyMuPDF error: {e}')
+        print(f'  PyMuPDF text extraction error: {e}')
         return ''
 
 
 def extract_text_ocr(pdf_path):
+    """OCR via PyMuPDF rendering + Tesseract (no poppler needed)."""
     try:
-        from pdf2image import convert_from_path
+        import pymupdf
+        from PIL import Image
         import pytesseract
-        images = convert_from_path(pdf_path, dpi=300)
+        import io
+
+        doc = pymupdf.open(pdf_path)
         text = ''
-        for img in images:
-            text += pytesseract.image_to_string(img, lang='ara+eng')
+        for i, page in enumerate(doc):
+            pix = page.get_pixmap(dpi=300)
+            img_data = pix.tobytes('png')
+            img = Image.open(io.BytesIO(img_data))
+            page_text = pytesseract.image_to_string(img, lang='ara+eng')
+            text += f'\n--- صفحة {i + 1} ---\n' + page_text
+        doc.close()
         return text
     except Exception as e:
         print(f'  OCR error: {e}')
@@ -66,13 +73,13 @@ def extract_header_fields(text):
     }
 
     patterns = {
-        'patient_name':   r'إسم المريض\s*:?\s*([^\n]+)',
+        'patient_name':   r'إ?سم المريض\s*:?\s*([^\n]+)',
         'national_id':    r'الرقم القومي\s*:?\s*(\d{10,14})',
-        'doctor_name':    r'إسم الطبي\s*:?\s*([^\n]+)',
+        'doctor_name':    r'إ?سم الطبي\s*:?\s*([^\n]+)',
         'specialty':      r'التخصص\s*:?\s*([^\n]+)',
-        'admission_date': r'تاريخ\s*/\s*وقت الدخول\s*:?\s*(\d{1,2}/\d{1,2}/\d{4})',
-        'discharge_date': r'تاريخ\s*/\s*وقت الخروج\s*:?\s*(\d{1,2}/\d{1,2}/\d{4})',
-        'hospital_name':  r'إسم المنشأ\s*:?\s*([^\n]+)',
+        'admission_date': r'وقت الدخول\s*:?\s*(\d{1,2}/\d{1,2}/\d{4})',
+        'discharge_date': r'وقت الخروج\s*:?\s*(\d{1,2}/\d{1,2}/\d{4})',
+        'hospital_name':  r'إ?سم المنشأ\s*:?\s*([^\n]+)',
         'referral_number': r'رقم الإحالة\s*:?\s*([A-Z0-9]+)',
         'total_amount':   r'الاجمالي\s*:?\s*([\d.,]+)',
     }
@@ -82,12 +89,10 @@ def extract_header_fields(text):
         if m:
             fields[key] = m.group(1).strip()
 
-    # التشخيص
     m = re.search(r'Primary\s*-\s*([^\n]+?)(?:\s+Secondary|$)', text)
     if m:
         fields['diagnosis'] = m.group(1).strip()
 
-    # تحويل المبلغ لرقم
     if fields['total_amount']:
         try:
             fields['total_amount'] = float(fields['total_amount'].replace(',', ''))

@@ -1,19 +1,16 @@
 """
 AdamOCR — استخراج نصوص وحقول وخدمات من فواتير طبية PDF
 - PyMuPDF + Tesseract OCR
-- regex لاستخراج الحقول (بعد تنظيف RTL/LTR marks)
-- fuzzy match مع lookup/*.json (أطباء، أصناف، عمليات)
-- JSON output
+- regex لاستخراج حقول الرأس + خدمات (اسم عربي + كمية فقط)
+- JSON output جاهز للمطابقة في التطبيق
 """
 import os
 import re
 import json
 import shutil
 import platform
-from difflib import SequenceMatcher
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-LOOKUP_DIR = os.path.join(BASE_DIR, 'lookup')
 INPUT_DIR = os.path.join(BASE_DIR, 'input_pdfs')
 OUTPUT_DIR = os.path.join(BASE_DIR, 'results')
 
@@ -42,123 +39,12 @@ def _setup_tesseract():
 _setup_tesseract()
 
 
-def load_lookup():
-    data = {'doctors': [], 'items': [], 'operations': []}
-    for key, filename in [
-        ('doctors', 'doctors.json'),
-        ('items', 'items.json'),
-        ('operations', 'operations.json'),
-    ]:
-        path = os.path.join(LOOKUP_DIR, filename)
-        if os.path.exists(path):
-            try:
-                # utf-8-sig يتعامل مع BOM
-                with open(path, 'r', encoding='utf-8-sig') as f:
-                    data[key] = json.load(f)
-                print(f'  Loaded {len(data[key])} {key}')
-            except Exception as e:
-                print(f'  Error loading {filename}: {e}')
-        else:
-            print(f'  Lookup missing: {path}')
-    return data
-
-
-LOOKUP = load_lookup()
-
-
 def clean_rtl_marks(text):
-    """إزالة RTL/LTR marks والأحرف الخفية اللي بتلخبط regex."""
     if not text:
         return ''
-    # U+200E (LTR mark), U+200F (RTL mark), U+202A-U+202E (embedding), U+2066-U+2069 (isolate)
     text = re.sub(r'[\u200E\u200F\u202A-\u202E\u2066-\u2069\u061C]', '', text)
-    # تحويل بعض الأحرف العربية الخاصة
     text = text.replace('', '').replace('', '')
     return text
-
-
-def _normalize_arabic(text):
-    if not text:
-        return ''
-    text = re.sub(r'[\u064B-\u0652]', '', text)
-    text = text.replace('أ', 'ا').replace('إ', 'ا').replace('آ', 'ا')
-    text = text.replace('ة', 'ه').replace('ى', 'ي')
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip().lower()
-
-
-def _normalize_english(text):
-    if not text:
-        return ''
-    text = re.sub(r'\s+', ' ', text).strip().lower()
-    return text
-
-
-def match_doctor(name_from_pdf):
-    if not name_from_pdf:
-        return None
-    norm = _normalize_english(name_from_pdf)
-    norm_ar = _normalize_arabic(name_from_pdf)
-    best, best_ratio = None, 0.0
-    for d in LOOKUP['doctors']:
-        eng = _normalize_english(d.get('english_name', ''))
-        full_ar = _normalize_arabic(d.get('full_name', ''))
-        triple = _normalize_arabic(d.get('triple_name', ''))
-        r1 = SequenceMatcher(None, norm, eng).ratio() if eng else 0
-        r2 = SequenceMatcher(None, norm_ar, full_ar).ratio() if full_ar else 0
-        r3 = SequenceMatcher(None, norm_ar, triple).ratio() if triple else 0
-        ratio = max(r1, r2, r3)
-        if ratio > best_ratio:
-            best_ratio = ratio
-            best = d
-    if best and best_ratio >= 0.5:
-        return {
-            'matched_full_name_ar': best['full_name'],
-            'matched_english': best['english_name'],
-            'similarity': round(best_ratio, 2),
-        }
-    return None
-
-
-def match_operation(name_from_pdf):
-    if not name_from_pdf:
-        return None
-    norm = _normalize_arabic(name_from_pdf)
-    best, best_ratio = None, 0.0
-    for op in LOOKUP['operations']:
-        norm_op = _normalize_arabic(op.get('name', ''))
-        ratio = SequenceMatcher(None, norm, norm_op).ratio()
-        if ratio > best_ratio:
-            best_ratio = ratio
-            best = op
-    if best and best_ratio >= 0.5:
-        return {
-            'matched_code': best['code'],
-            'matched_name': best['name'],
-            'similarity': round(best_ratio, 2),
-        }
-    return None
-
-
-def match_item(name_from_pdf):
-    if not name_from_pdf:
-        return None
-    norm = _normalize_arabic(name_from_pdf)
-    best, best_ratio = None, 0.0
-    for it in LOOKUP['items']:
-        norm_it = _normalize_arabic(it.get('name', ''))
-        ratio = SequenceMatcher(None, norm, norm_it).ratio()
-        if ratio > best_ratio:
-            best_ratio = ratio
-            best = it
-    if best and best_ratio >= 0.6:
-        return {
-            'matched_code': best['code'],
-            'matched_name': best['name'],
-            'unit': best.get('unit'),
-            'similarity': round(best_ratio, 2),
-        }
-    return None
 
 
 def extract_text_pymupdf(pdf_path):
@@ -206,39 +92,43 @@ def is_text_usable(text):
 def extract_header_fields(original_text):
     text = clean_rtl_marks(original_text)
     fields = {
-        'patient_name': None, 'national_id': None,
-        'doctor_name_raw': None, 'doctor_matched': None,
-        'specialty': None, 'admission_date': None, 'discharge_date': None,
-        'diagnosis': None, 'hospital_name': None,
-        'referral_number': None, 'total_amount': None,
+        'patient_name': None,
+        'national_id': None,
+        'doctor_name_raw': None,
+        'specialty': None,
+        'admission_date': None,
+        'discharge_date': None,
+        'diagnosis': None,
+        'hospital_name': None,
+        'referral_number': None,
+        'total_amount': None,
     }
 
-    # الطبيب: الاسم الإنجليزي قبل "إسم الطبيب"
+    # الطبيب
     m = re.search(r'([A-Z][a-zA-Z\s\.]+?)\s+إسم\s+الطبيب', text)
     if m:
         fields['doctor_name_raw'] = m.group(1).strip()
     else:
-        # أو بعد "إسم الطبيب:"
         m = re.search(r'إسم\s+الطبيب\s*:?\s*([A-Za-z][a-zA-Z\s\.]+)', text)
         if m:
             fields['doctor_name_raw'] = m.group(1).strip()
 
-    if fields['doctor_name_raw']:
-        fields['doctor_matched'] = match_doctor(fields['doctor_name_raw'])
-
+    # المريض
     m = re.search(r'إسم\s+المريض\s*:?\s*([^\n]+)', text)
     if m:
         fields['patient_name'] = m.group(1).strip()
 
+    # الرقم القومي
     m = re.search(r'الرقم\s+القومي\s*:?\s*(\d{10,14})', text)
     if m:
         fields['national_id'] = m.group(1)
 
+    # التخصص
     m = re.search(r'التخصص\s*:?\s*([^\n]+)', text)
     if m:
         fields['specialty'] = m.group(1).strip()
 
-    # التواريخ (OCR بيحط الوقت قبل التاريخ)
+    # التواريخ
     m = re.search(r'وقت\s+الدخول\s*:?\s*(?:\d{1,2}:\d{2}:\d{2})?\s*(\d{1,2}/\d{1,2}/\d{4})', text)
     if m:
         fields['admission_date'] = m.group(1)
@@ -246,7 +136,7 @@ def extract_header_fields(original_text):
     if m:
         fields['discharge_date'] = m.group(1)
 
-    # المنشأة: بعد "إسم المنشأ"
+    # المنشأة
     m = re.search(r'إسم\s+المنشأ[هة]?\s*:?\s*([A-Z][a-zA-Z\s\.]+)', text)
     if m:
         fields['hospital_name'] = m.group(1).strip().rstrip('اع').strip()
@@ -273,6 +163,10 @@ def extract_header_fields(original_text):
 
 
 def extract_services(original_text):
+    """
+    استخراج الخدمات: اسم عربي (كما هو من PDF) + كمية فقط.
+    بدون سعر، بدون مطابقة، بدون أي بيانات إضافية.
+    """
     text = clean_rtl_marks(original_text)
     services = []
 
@@ -289,19 +183,17 @@ def extract_services(original_text):
             line = line.strip()
             if not line or 'كود الخدمة' in line or 'اسم الخدمة' in line:
                 continue
-            m = re.search(r'([\u0600-\u06FF][\u0600-\u06FF\s]+?)\s+(\d+)\s+(\d+)\s+(\d+)', line)
+            # اسم عربي + كمية (أول رقم بعد الاسم)
+            m = re.search(r'([\u0600-\u06FF][\u0600-\u06FF\s]+?)\s+(\d+)', line)
             if m:
                 name = m.group(1).strip()
                 qty = int(m.group(2))
-                price = int(m.group(3))
-                services.append({
-                    'section': section,
-                    'name': name,
-                    'quantity': qty,
-                    'price': price,
-                    'matched_operation': match_operation(name),
-                    'matched_item': match_item(name),
-                })
+                if name and qty > 0:
+                    services.append({
+                        'section': section,
+                        'raw_name': name,
+                        'qty': qty,
+                    })
     return services
 
 

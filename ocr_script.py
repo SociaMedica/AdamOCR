@@ -8,6 +8,45 @@ AdamOCR — استخراج نصوص وحقول من فواتير طبية PDF
 import os
 import re
 import json
+import shutil
+import platform
+
+
+def _setup_tesseract():
+    """auto-detect Tesseract path + tessdata."""
+    try:
+        import pytesseract
+
+        # 1) لو موجود في PATH
+        if shutil.which('tesseract'):
+            print(f'  tesseract in PATH: {shutil.which("tesseract")}')
+            return
+
+        # 2) Windows: مسارات شائعة
+        if platform.system() == 'Windows':
+            candidates = [
+                r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+                r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+                os.path.expanduser(r'~\AppData\Local\Programs\Tesseract-OCR\tesseract.exe'),
+            ]
+            for c in candidates:
+                if os.path.exists(c):
+                    pytesseract.pytesseract.tesseract_cmd = c
+                    print(f'  tesseract found: {c}')
+                    # tessdata: نستخدم مجلد المستخدم لو موجود (فيه ara)
+                    user_tessdata = os.path.expanduser(r'~\tessdata')
+                    if os.path.exists(os.path.join(user_tessdata, 'ara.traineddata')):
+                        os.environ['TESSDATA_PREFIX'] = user_tessdata
+                        print(f'  tessdata: {user_tessdata}')
+                    return
+        # 3) Linux (GitHub Actions)
+        else:
+            print('  Linux: relying on system tesseract')
+    except Exception as e:
+        print(f'  tesseract setup error: {e}')
+
+
+_setup_tesseract()
 
 INPUT_DIR = 'input_pdfs'
 OUTPUT_DIR = 'results'

@@ -1,7 +1,7 @@
 """
 AdamOCR — استخراج نصوص وحقول وخدمات من فواتير طبية PDF
 - PyMuPDF + Tesseract OCR
-- استخراج: بيانات المريض + doctor_name_raw (إنجليزي) + services (اسم عربي + كمية فقط)
+- استخراج: بيانات المريض + doctor_name_raw + services (اسم عربي + كمية فقط)
 """
 import os
 import re
@@ -91,15 +91,9 @@ def is_text_usable(text):
 def extract_header_fields(original_text):
     text = clean_rtl_marks(original_text)
     fields = {
-        'patient_name': None,
-        'national_id': None,
-        'doctor_name_raw': None,
-        'specialty': None,
-        'admission_date': None,
-        'discharge_date': None,
-        'diagnosis': None,
-        'hospital_name': None,
-        'referral_number': None,
+        'patient_name': None, 'national_id': None, 'doctor_name_raw': None,
+        'specialty': None, 'admission_date': None, 'discharge_date': None,
+        'diagnosis': None, 'hospital_name': None, 'referral_number': None,
         'total_amount': None,
     }
 
@@ -152,90 +146,116 @@ def extract_header_fields(original_text):
     return fields
 
 
-# وحدات القياس الشائعة (عربي + إنجليزي)
 UNITS = [
     'عدد', 'قطعة', 'قطعه', 'دزينة', 'دزينه', 'علبة', 'علبه',
     'أمبول', 'امبول', 'فيال', 'سم', 'مجم', 'ملجم', 'جرام', 'كيس',
     'زجاجة', 'زجاجه', 'بكرة', 'بكره', 'متر', 'لتر', 'زوج',
     'شريط', 'شريطه', 'أنبوبة', 'انبوبة', 'باكو', 'باكيت',
+    'صندوق', 'صندوقه', 'حبة', 'حبه', 'قرص', 'اقراص', 'كبسولة',
     'pac', 'pack', 'pcs', 'tab', 'tabs', 'cap', 'caps', 'ml', 'mg', 'g', 'kg',
     'piece', 'pieces', 'amp', 'vial', 'box', 'bottle', 'drop', 'drops',
+    'unit', 'units', 'dose', 'doses',
 ]
 UNITS_PATTERN = '|'.join(re.escape(u) for u in UNITS)
 
-# كلمات العناوين اللي لازم نتجاهلها
 HEADER_KEYWORDS = [
     'كود الخدمة', 'اسم الخدمة', 'الكمية', 'سعر الوحدة',
     'حصة المريض', 'حصة التأمين', 'الإجمالي', 'الإجمالى',
     'نوع المريض', 'صفحة', 'Page of', 'مريض خارجى', 'مريض داخلى', 'مريض طوارئ',
+    'BLIPBILL', 'فاتورة', 'الهيئة العامة', 'مستشفى الحياة',
+    'UNIVERSAL HEALTH', 'إسم المريض', 'إسم المنشأ', 'الرقم القومي',
+    'التخصص', 'رقم الإحالة', 'Visit Type', 'Bill Date', 'Primary',
+    'Secondary', 'تاريخ', 'وقت', 'Inpatient',
 ]
+
+
+def _clean_line(line):
+    line = re.sub(r'[-—~_]+', ' ', line)
+    line = re.sub(r'\.{2,}', ' ', line)
+    line = re.sub(r'[^\w\s\./()\u0600-\u06FF]', ' ', line)
+    line = re.sub(r'\s+', ' ', line).strip()
+    return line
 
 
 def extract_services(original_text):
     text = clean_rtl_marks(original_text)
     services = []
+    seen_names = set()
 
-    def extract_section(section_name):
-        pattern = rf'{section_name}\s*:?\s*(.*?)(?=خدمات |الصيدلية|الإجمال[ىي]|$)'
-        m = re.search(pattern, text, re.DOTALL)
-        return m.group(1) if m else ''
+    def extract_section(section_names):
+        for sn in section_names:
+            pattern = rf'{sn}\s*:?\s*(.*?)(?=خدمات |الصيدلية|الإجمال[ىي]|$)'
+            m = re.search(pattern, text, re.DOTALL)
+            if m:
+                return m.group(1)
+        return ''
 
-    for section in ['الخدمات الآخر', 'الصيدلية', 'خدمات المعمل', 'خدمات الأشعة']:
-        section_text = extract_section(section)
+    section_groups = [
+        (['الخدمات الآخر', 'الخدمات الأخرى', 'الخدمات الاخرى', 'الخدمات الاخر'], 'الخدمات الأخرى'),
+        (['الصيدلية', 'صيدلية'], 'الصيدلية'),
+        (['خدمات المعمل', 'معمل'], 'خدمات المعمل'),
+        (['خدمات الأشعة', 'أشعة', 'اشعة'], 'خدمات الأشعة'),
+    ]
+
+    for patterns, display_name in section_groups:
+        section_text = extract_section(patterns)
         if not section_text:
             continue
 
-        for line in section_text.split('\n'):
-            line = line.strip()
+        for raw_line in section_text.split('\n'):
+            line = raw_line.strip()
             if not line:
                 continue
-
-            # تجاهل العناوين
             if any(kw in line for kw in HEADER_KEYWORDS):
                 continue
 
-            # لازم آخر 4 أرقام على الأقل: (سعر وحدة، إجمالي، حصة مريض، حصة تأمين)
+            line_clean = _clean_line(line)
+            if not line_clean:
+                continue
+
             m = re.search(
-                r'^(.+?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s*$',
-                line
+                r'(.+?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s*$',
+                line_clean
             )
             if not m:
                 continue
 
             prefix = m.group(1).strip()
 
-            # إزالة الأكواد الرقمية من بداية السطر
-            # 1) أرقام في الأول
-            prefix = re.sub(r'^[\d\.\-\s]+', '', prefix)
-            # 2) كود بصيغة [حرف]?\d+-\d+(-\d+)?
-            prefix = re.sub(r'^[A-Za-z]?\d+-\d+(?:-\d+)?\s*', '', prefix)
-            # 3) أرقام طويلة متتالية (5+) وسط النص
-            prefix = re.sub(r'\b\d{5,}\b', '', prefix)
+            prefix = re.sub(r'^[\w\.\-\s/]{10,}?(?=[\u0600-\u06FF])', '', prefix).strip()
+            prefix = re.sub(r'^[\d\.\-\s]+', '', prefix).strip()
+            prefix = re.sub(r'\b\d{5,}\b.*$', '', prefix).strip()
+            prefix = re.sub(
+                rf'\s+(?:{UNITS_PATTERN})\s+\d+(?:\.\d+)?\s*$',
+                '', prefix, flags=re.IGNORECASE
+            ).strip()
+            prefix = re.sub(
+                rf'\s+(?:{UNITS_PATTERN})\s*$',
+                '', prefix, flags=re.IGNORECASE
+            ).strip()
 
-            # إزالة (وحدة + رقم) من آخر prefix (زي "قطعه 2" أو "pac 5")
-            prefix = re.sub(rf'\s+(?:{UNITS_PATTERN})\s+\d+(?:\.\d+)?\s*$',
-                            '', prefix, flags=re.IGNORECASE)
-            # إزالة وحدة في آخر prefix لوحدها
-            prefix = re.sub(rf'\s+(?:{UNITS_PATTERN})\s*$',
-                            '', prefix, flags=re.IGNORECASE)
-
-            # آخر رقم = الكمية
-            qty_m = re.search(r'(\d+(?:\.\d+)?)\s*$', prefix)
+            qty_m = re.search(r'(\d+)\s*$', prefix)
             if not qty_m:
                 continue
-            qty = float(qty_m.group(1))
+            qty = int(qty_m.group(1))
 
             name = prefix[:qty_m.start()].strip()
             name = re.sub(r'\s+', ' ', name).strip()
+            name = re.sub(r'[-—~_.]+$', '', name).strip()
+            name = re.sub(r'^[-—~_.]+', '', name).strip()
 
-            # تحقق: الاسم موجود وفيه 5 أحرف على الأقل
             if not name or len(name) < 5:
                 continue
-            if qty <= 0:
+            if qty <= 0 or qty > 10000:
                 continue
 
+            key = f'{display_name}|{name}|{qty}'
+            if key in seen_names:
+                continue
+            seen_names.add(key)
+
             services.append({
-                'section': section,
+                'section': display_name,
                 'raw_name': name,
                 'qty': qty,
             })
